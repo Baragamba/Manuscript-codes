@@ -1,0 +1,111 @@
+# ===========================
+# CA-ANN LULC Projection
+# ===========================
+
+library(terra)
+library(nnet)
+library(caret)
+
+# ---------------------------
+# File paths
+# ---------------------------
+lulc_path <- "D:/SCHOOLING/PhD STUDIES/RESEARCH/DISSERTATION/DATA/LULCC/RESEARCH WORK/NEW LULC_v1/SSPs/DRIVERS/LULC"
+drivers_path <- "D:/SCHOOLING/PhD STUDIES/RESEARCH/DISSERTATION/DATA/LULCC/RESEARCH WORK/NEW LULC_v1/SSPs/DRIVERS/trial"
+
+# ---------------------------
+# Load LULC maps
+# ---------------------------
+lulc_1992 <- rast(file.path(lulc_path, "LULC 1992.tif"))
+lulc_2022 <- rast(file.path(lulc_path, "LULC 2022.tif"))
+template <- lulc_2022
+
+# Transition potential map (changed vs unchanged)
+transitions <- lulc_2022 - lulc_1992
+transition_binary <- classify(transitions, rcl = matrix(c(-Inf,0,0,0,Inf,1), ncol=3, byrow=TRUE))
+names(transition_binary) <- "transition_potential"
+
+# ---------------------------
+# Load drivers
+# ---------------------------
+drivers_all <- rast(list.files(drivers_path, pattern="\\.tif$", full.names=TRUE))
+names(drivers_all) <- c("DEM","Soil","Rainfall","Temperature","GDP","Population","UrbanGrowth")
+
+# Add slope from DEM
+slope <- terrain(drivers_all[["DEM"]], v="slope", unit="degrees")
+names(slope) <- "Slope"
+
+# ---------------------------
+# Add Neighborhood effect (CA component)
+# ---------------------------
+# Example: urban density in 5x5 moving window
+urban_mask <- (lulc_2022 == some_code_for_urban) # replace with actual LULC urban code
+neigh_urban <- focal(urban_mask, w=matrix(1,5,5), fun="mean", na.policy="omit")
+names(neigh_urban) <- "UrbanDensity"
+
+# ---------------------------
+# Combine predictors
+# ---------------------------
+drivers_selected <- c(
+  drivers_all[["DEM"]], slope,
+  drivers_all[["Soil"]], drivers_all[["Rainfall"]],
+  drivers_all[["Temperature"]], drivers_all[["GDP"]],
+  drivers_all[["Population"]], drivers_all[["UrbanGrowth"]],
+  neigh_urban
+)
+
+# Align rasters
+drivers_selected <- resample(drivers_selected, template, method="bilinear")
+transition_binary <- resample(transition_binary, template, method="near")
+
+# ---------------------------
+# Training Data
+# ---------------------------
+training_stack <- c(transition_binary, drivers_selected)
+training_df <- as.data.frame(training_stack, xy=FALSE, na.rm=TRUE)
+training_df <- na.omit(training_df)
+training_df$transition_potential <- as.factor(training_df$transition_potential)
+
+# ---------------------------
+# Train ANN
+# ---------------------------
+set.seed(42)
+ann_model <- nnet(
+  transition_potential ~ ., 
+  data = training_df, 
+  size = 12, maxit = 2000, trace=FALSE
+)
+
+# ---------------------------
+# Predict Transition Potentials
+# ---------------------------
+prediction_df <- as.data.frame(drivers_selected, xy=FALSE, na.rm=FALSE)
+prediction_df <- na.omit(prediction_df)
+
+predicted_probs <- predict(ann_model, newdata=prediction_df, type="raw")
+
+prob_raster <- template
+values(prob_raster)[!is.na(values(template))][1:length(predicted_probs)] <- predicted_probs
+names(prob_raster) <- "transition_probability"
+
+# ---------------------------
+# Allocation: CA Step
+# ---------------------------
+# Define total change expected (e.g., based on observed or scenario)
+total_change <- cellStats(transition_binary, "sum") * 1.2  # +20% growth
+
+# Select top N pixels with highest probability
+prob_values <- values(prob_raster)
+change_threshold <- sort(prob_values, decreasing=TRUE)[total_change]
+simulated_change <- prob_raster >= change_threshold
+
+# ---------------------------
+# Simulate Future LULC
+# ---------------------------
+simulated_lulc <- lulc_2022
+simulated_lulc[which(values(simulated_change) == 1)] <- some_code_for_urban  # allocate to urban
+
+# Save
+writeRaster(prob_raster, file.path(lulc_path,"CAANN_transition_probability.tif"), overwrite=TRUE)
+writeRaster(simulated_lulc, file.path(lulc_path,"CAANN_LULC_2052.tif"), overwrite=TRUE)
+
+cat("✅ CA-ANN simulation complete.\n")
